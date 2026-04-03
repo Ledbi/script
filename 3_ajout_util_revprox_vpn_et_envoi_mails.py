@@ -12,7 +12,7 @@ from email.message import EmailMessage
 REMOTE_IP = "10.0.0.17"
 REMOTE_USER = "httpauthadm"
 HTPASSWD_PATH = "/etc/nginx/.htpasswd"
-USER_SOURCE_FILE = "/root/creation_utilisateurs/mots_de_passe.csv" 
+USER_SOURCE_FILE = "/root/creation_utilisateurs/mots_de_passe.csv"
 
 # --- CONFIGURATION SMTP KOLAB (C2LR) ---
 SMTP_SERVER = "smtp.c2lr.fr"
@@ -42,9 +42,9 @@ def run_remote_cmd(admin_pass, user_to_add, pass_to_add, email_dest):
     """Crée l'accès sur Nginx via SSH."""
     remote_command = f"htpasswd -b {HTPASSWD_PATH} {user_to_add} {pass_to_add}"
     full_ssh_command = [
-        "sshpass", "-p", admin_pass, 
-        "ssh", "-o", "StrictHostKeyChecking=no", 
-        f"{REMOTE_USER}@{REMOTE_IP}", 
+        "sshpass", "-p", admin_pass,
+        "ssh", "-o", "StrictHostKeyChecking=no",
+        f"{REMOTE_USER}@{REMOTE_IP}",
         remote_command
     ]
 
@@ -59,7 +59,7 @@ def main():
     if not os.path.exists(USER_SOURCE_FILE):
         print(f"Fichier {USER_SOURCE_FILE} introuvable.")
         return
-    
+
     admin_pass = getpass.getpass("Mot de passe SSH (10.0.0.17) : ")
 
     with open(USER_SOURCE_FILE, "r") as f:
@@ -67,25 +67,26 @@ def main():
             line = line.strip()
             if not line:
                 continue
-                
+
             parts = line.split(",")
-            
-            # CONDITION POUR IGNORER L'EN-TETE
-            if parts[0].lower() == "username":
+
+            # Ignore la ligne d'en-tête (supporte "login" et "username")
+            if parts[0].lower() in ("login", "username"):
                 continue
-                
-            # On vérifie qu'on a bien 3 éléments (username, password, email)
+
+            # On prend les 3 premiers champs : login, password, email
+            # Les colonnes suivantes (ip_debut, ip_fin, id_debut, id_fin, etc.)
+            # sont ignorées ici car ce script ne les utilise pas
             if len(parts) >= 3:
                 u = parts[0].strip()
                 p = parts[1].strip()
                 e = parts[2].strip()
-                
+
                 run_remote_cmd(admin_pass, u, p, e)
-                
+
                 print(f"⏳ Cooldown 5s...")
                 time.sleep(5)
             else:
-                # Si on arrive ici, c'est que la ligne n'est pas l'en-tête mais est quand même incomplète
                 print(f"⚠️ Ligne malformée (colonnes manquantes) : {line}")
 
 if __name__ == "__main__":
