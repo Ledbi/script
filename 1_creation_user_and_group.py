@@ -84,7 +84,7 @@ gidNumber: {gid}
         f.write(ldif)
     run(f"ldapadd -x -D '{ADMIN_DN}' -w '{ADMIN_PASS}' -f /tmp/{groupname}.ldif")
 
-def create_ldap_user(username, email, groupname, writer):
+def create_ldap_user(username, email, ip_debut, ip_fin, id_debut, id_fin, groupname, writer):
     dn = f"uid={username},ou=People,{BASE_DN}"
 
     if entry_exists(dn):
@@ -93,12 +93,9 @@ def create_ldap_user(username, email, groupname, writer):
 
     uid = get_next_uid()
     gid = GROUP_GID[groupname]
-    
-    # GÉNÉRATION DU MOT DE PASSE EN CLAIR
+
     password_plain = generate_password()
 
-    # ICI : On envoie le password tel quel. 
-    # OpenLDAP le hachera à la réception s'il est configuré pour.
     ldif = f"""
 dn: {dn}
 objectClass: inetOrgPerson
@@ -121,8 +118,9 @@ userPassword: {password_plain}
     result = run(f"ldapadd -x -D '{ADMIN_DN}' -w '{ADMIN_PASS}' -f /tmp/{username}.ldif")
 
     if result.returncode == 0:
-        writer.writerow([username, password_plain, email])
-        print(f"✅ OK : {username} créé (hachage par OpenLDAP)")
+        # On écrit aussi les plages IP et ID dans le CSV
+        writer.writerow([username, password_plain, email, ip_debut, ip_fin, id_debut, id_fin])
+        print(f"✅ OK : {username} créé (IP: {ip_debut} -> {ip_fin} | ID: {id_debut} -> {id_fin})")
     else:
         print(f"❌ ERREUR LDAP pour {username} : {result.stderr.decode().strip()}")
 
@@ -133,22 +131,36 @@ def import_users_into_group(groupname):
 
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["login", "password", "email"])
+        writer.writerow(["login", "password", "email", "ip_debut", "ip_fin", "id_debut", "id_fin"])
 
         print(f"👤 Traitement des utilisateurs pour le groupe : {groupname}...")
         with open(USERS_FILE, "r") as f:
             for line in f:
                 line = line.strip()
-                if line and "," in line:
-                    login, email = line.split(",", 1)
-                    create_ldap_user(login.strip(), email.strip(), groupname, writer)
-        
+                if not line:
+                    continue
+
+                parts = [p.strip() for p in line.split(",")]
+
+                # Format attendu : login,email,ip_debut,ip_fin,id_debut,id_fin
+                if len(parts) == 6:
+                    login, email, ip_debut, ip_fin, id_debut, id_fin = parts
+                    create_ldap_user(login, email, ip_debut, ip_fin, id_debut, id_fin, groupname, writer)
+
+                # Format minimal sans plages (rétrocompatibilité) : login,email
+                elif len(parts) == 2:
+                    login, email = parts
+                    create_ldap_user(login, email, "", "", "", "", groupname, writer)
+
+                else:
+                    print(f"⚠️ Ligne ignorée (format invalide) : {line}")
+
         csvfile.flush()
         os.fsync(csvfile.fileno())
 
     print("\n✅ Opération terminée.")
     print(f"📁 Fichier généré : {CSV_FILE}")
-    
+
     print("--- Contenu du fichier CSV ---")
     with open(CSV_FILE, "r") as check:
         print(check.read())
