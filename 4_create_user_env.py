@@ -7,7 +7,7 @@ import json
 
 # ================= CONFIGURATION =================
 HOST = "pveZ1"
-USER_SSH = "root"  
+USER_SSH = "root"
 ROLE = "DroitUtilisateur"
 GROUP_NAME = "utilisateurs"
 REALM = "ldap-c2lr"
@@ -30,7 +30,7 @@ class ProxmoxManager:
         stdin, stdout, stderr = self.client.exec_command(cmd)
         out = stdout.read().decode().strip()
         err = stderr.read().decode().strip()
-        
+
         if err and not ignore_error and "already exists" not in err:
             print(f"[ERREUR] {err}")
         return out
@@ -39,15 +39,16 @@ class ProxmoxManager:
         """Gère l'ajout au groupe Proxmox sur le serveur distant."""
         if GROUP_NAME not in self.run_remote("pveum group list", True):
             self.run_remote(f"pveum group add {GROUP_NAME}")
-        
+
         output = self.run_remote(f"pveum user list --userid {userid} --output-format json", True)
         current_groups = ""
         if output:
             try:
                 user_data = json.loads(output)
                 current_groups = user_data[0].get("groups", "")
-            except: pass
-        
+            except:
+                pass
+
         group_list = [g.strip() for g in current_groups.split(',') if g.strip()]
         if GROUP_NAME not in group_list:
             group_list.append(GROUP_NAME)
@@ -55,12 +56,26 @@ class ProxmoxManager:
 
     def process_user(self, line):
         line = line.strip()
-        if not line: return
-        
-        # Extraction du login avant la virgule
-        user = line.split(',')[0].strip() 
+
+        # Ignore les lignes vides
+        if not line:
+            return
+
+        parts = line.split(',')
+
+        # Ignore la ligne d'en-tête (login,email,ip_debut,ip_fin,id_debut,id_fin)
+        if parts[0].strip().lower() in ("login", "username"):
+            return
+
+        # Vérifie qu'on a au minimum un login
+        if len(parts) < 1 or not parts[0].strip():
+            print(f"⚠️ Ligne ignorée (format invalide) : {line}")
+            return
+
+        # Extraction du login (les autres colonnes sont ignorées ici)
+        user = parts[0].strip()
         full_id = f"{user}@{REALM}"
-        
+
         # Vérification si l'utilisateur existe dans PVE
         if full_id not in self.run_remote("pveum user list"):
             print(f"[SKIP] {full_id} non trouvé sur le serveur.")
@@ -70,24 +85,24 @@ class ProxmoxManager:
 
         print(f"\n>>> CONFIGURATION DISTANTE : {user.upper()}")
 
-        # --- 1. Variante Création de Pool (pveum pool add) ---
-        # On vérifie si le pool existe déjà avant d'essayer de l'ajouter
-        check_pool = self.run_remote(f"pveum pool list", True)
+        # 1. Création du pool si inexistant
+        check_pool = self.run_remote("pveum pool list", True)
         if pool_name not in check_pool:
             self.run_remote(f"pveum pool add {pool_name}")
             print(f"✅ Pool '{pool_name}' créé.")
         else:
             print(f"ℹ Pool '{pool_name}' existe déjà.")
-        
+
         # 2. Groupe
         self.manage_user_group(full_id)
-        
-        # 3. ACL (On force l'application des droits sur le pool)
+
+        # 3. ACL
         self.run_remote(f"pveum aclmod /pool/{pool_name} --user {full_id} --role {ROLE} --propagate 1")
-        
+
         print(f"✔ Terminé pour {user}.")
 
 def main():
+    print("⚠️  Avez-vous bien pensé à sync le realm sur Proxmox ?")
     password = getpass.getpass(f"Mot de passe pour {USER_SSH}@{HOST} : ")
 
     if not os.path.exists(USERS_FILE):
