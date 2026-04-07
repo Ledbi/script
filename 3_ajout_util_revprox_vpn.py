@@ -1,93 +1,206 @@
 import subprocess
 import getpass
 import os
-import smtplib
-import time
 import csv
-import secrets
-import string
-from email.message import EmailMessage
+import shlex
 
-# --- CONFIGURATION SSH / NGINX ---
-REMOTE_IP = "10.0.0.17"
-REMOTE_USER = "httpauthadm"
+# ==============================================================================
+# --- CONFIGURATION ---
+# ==============================================================================
+REMOTE_NGINX_IP = "10.0.0.17"
+REMOTE_VPN_IP = "10.0.0.20"
+USER_NGINX = "httpauthadm"
+USER_VPN = "root"
+
 HTPASSWD_PATH = "/etc/nginx/.htpasswd"
-USER_SOURCE_FILE = "/root/creation_utilisateurs/mots_de_passe.csv"
+WG_CONF_PATH = "/etc/wireguard/wg0.conf"
+USER_FOLDER = "/root/creation_utilisateurs"
+USER_SOURCE_FILE = os.path.join(USER_FOLDER, "mots_de_passe.csv")
 
-# --- CONFIGURATION SMTP KOLAB (C2LR) ---
-SMTP_SERVER = "smtp.c2lr.fr"
-SMTP_PORT = 587
-SENDER_EMAIL = "cluz@c2lr.fr"
-SENDER_PASSWORD = "OIP4WX7xYIUa0zx"
+IP_STORAGE_FILE = os.path.join(USER_FOLDER, "utilisees.txt")
 
-def send_confirmation_mail(username, password, dest_email):
-    """Envoie les identifiants via le serveur SMTP Kolab."""
-    msg = EmailMessage()
-    msg.set_content(f"Bonjour,\n\nTes accès au Reverse Proxy ont été configurés :\n\nLogin: {username}\nMot de passe: {password}\n\nL'administration.")
-    msg['Subject'] = f"Accès créé : {username}"
-    msg['From'] = SENDER_EMAIL
-    msg['To'] = dest_email
+SERVER_PUB_KEY = "Vjiy6Y1/wZzngkGJmHsoUiW9GMJ33/fTyXTYWr70MBg="
 
-    try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
-        server.login(SENDER_EMAIL, SENDER_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-        print(f"📧 Mail envoyé avec succès à {dest_email}")
-    except Exception as e:
-        print(f"❌ Erreur SMTP Kolab : {e}")
+# ==============================================================================
+# --- FONCTIONS TECHNIQUES ---
+# ==============================================================================
 
-def run_remote_cmd(admin_pass, user_to_add, pass_to_add, email_dest):
-    """Crée l'accès sur Nginx via SSH."""
-    remote_command = f"htpasswd -b {HTPASSWD_PATH} {user_to_add} {pass_to_add}"
-    full_ssh_command = [
-        "sshpass", "-p", admin_pass,
-        "ssh", "-o", "StrictHostKeyChecking=no",
-        f"{REMOTE_USER}@{REMOTE_IP}",
-        remote_command
-    ]
+def run_remote_cmd(ip, user, command, admin_pass=None):
+    """Exécute une commande SSH à distance avec gestion optionnelle du mot de passe."""
+    if admin_pass:
+        env = os.environ.copy()
+        env["SSHPASS"] = admin_pass
+        full_ssh_command = [
+            "sshpass", "-e", "ssh", "-o", "StrictHostKeyChecking=no",
+            f"{user}@{ip}", command
+        ]
+        return subprocess.run(full_ssh_command, capture_output=True, text=True, env=env)
+    else:
+        full_ssh_command = [
+            "ssh", "-o", "StrictHostKeyChecking=no",
+            f"{user}@{ip}", command
+        ]
+        return subprocess.run(full_ssh_command, capture_output=True, text=True)
 
-    try:
-        subprocess.run(full_ssh_command, capture_output=True, text=True, check=True)
-        print(f"✅ Utilisateur {user_to_add} ajouté sur Nginx.")
-        send_confirmation_mail(user_to_add, pass_to_add, email_dest)
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Erreur SSH : {e.stderr.strip()}")
+# ==============================================================================
+# --- PROGRAMME PRINCIPAL ---
+# ==============================================================================
 
 def main():
+    print(f"--- 🚀 DÉMARRAGE DU SCRIPT INTÉGRAL ---")
+
+    # 1. Préparation de l'environnement local
+    if not os.path.exists(USER_FOLDER):
+        os.makedirs(USER_FOLDER)
+        print(f"[LOG] Dossier de travail créé : {USER_FOLDER}")
+
+    if not os.path.exists(IP_STORAGE_FILE):
+        with open(IP_STORAGE_FILE, "w") as f:
+            f.write("19")
+        print(f"[LOG] Fichier de mémoire IP initialisé (Début à .20)")
+
     if not os.path.exists(USER_SOURCE_FILE):
-        print(f"Fichier {USER_SOURCE_FILE} introuvable.")
+        print(f"❌ ERREUR : Le fichier {USER_SOURCE_FILE} est introuvable.")
+        print(f"Veuillez créer le fichier avec les colonnes : login, password, email")
         return
 
-    admin_pass = getpass.getpass("Mot de passe SSH (10.0.0.17) : ")
+    # 2. Authentification SSH
+    pass_nginx = getpass.getpass(f"🔑 Mot de passe SSH pour {USER_NGINX}@{REMOTE_NGINX_IP} : ")
 
-    with open(USER_SOURCE_FILE, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+    # 3. Lecture des données CSV
+    try:
+        with open(USER_SOURCE_FILE, "r") as f:
+            reader = list(csv.reader(f))
+    except Exception as e:
+        print(f"❌ ERREUR lors de la lecture du CSV : {e}")
+        return
+
+    if len(reader) < 2:
+        print("⚠️ Le fichier CSV est vide ou ne contient que l'en-tête.")
+        return
+
+    header = [h.strip().lower() for h in reader[0]]
+    rows = reader[1:]
+    updated_rows = []
+
+    # 4. Lecture du compteur d'IP permanent
+    try:
+        with open(IP_STORAGE_FILE, "r") as f:
+            current_last_suffix = int(f.read().strip())
+    except:
+        current_last_suffix = 19
+
+    next_ip_suffix = current_last_suffix + 1
+
+    # 5. Traitement de chaque utilisateur
+    for row in rows:
+        if not row or len(row) < 3:
+            continue
+
+        u = row[header.index("login")].strip()
+        p = row[header.index("password")].strip()
+        e = row[header.index("email")].strip()
+
+        # Récupération des plages IP et ID (vides si absentes du CSV)
+        def get_col(col_name):
+            if col_name in header:
+                idx = header.index(col_name)
+                return row[idx].strip() if len(row) > idx else ""
+            return ""
+
+        ip_debut       = get_col("ip_debut")
+        ip_fin         = get_col("ip_fin")
+        id_debut       = get_col("id_debut")
+        id_fin         = get_col("id_fin")
+
+        print(f"\n--- 👤 TRAITEMENT DE : {u} ---")
+
+        # Gestion de l'IP VPN assignée
+        existing_ip = get_col("allowed_ip")
+
+        if existing_ip:
+            client_ip = existing_ip
+            print(f"      📍 IP existante détectée : {client_ip}")
+        else:
+            client_ip = f"192.168.110.{next_ip_suffix}/32"
+            print(f"      📍 Attribution d'une nouvelle IP : {client_ip}")
+            with open(IP_STORAGE_FILE, "w") as f:
+                f.write(str(next_ip_suffix))
+            next_ip_suffix += 1
+
+        try:
+            # --- ÉTAPE A : NGINX ---
+            cmd_nginx = f"htpasswd -b {HTPASSWD_PATH} {shlex.quote(u)} {shlex.quote(p)}"
+
+            print(f"      🌐 Mise à jour NGINX ({REMOTE_NGINX_IP})...")
+            res_n = run_remote_cmd(REMOTE_NGINX_IP, USER_NGINX, cmd_nginx, pass_nginx)
+
+            if res_n.returncode != 0:
+                print(f"      ❌ Erreur NGINX : {res_n.stderr.strip()}")
+                if res_n.stdout.strip():
+                    print(f"      ℹ️  stdout : {res_n.stdout.strip()}")
+                updated_rows.append(row)
                 continue
-
-            parts = line.split(",")
-
-            # Ignore la ligne d'en-tête (supporte "login" et "username")
-            if parts[0].lower() in ("login", "username"):
-                continue
-
-            # On prend les 3 premiers champs : login, password, email
-            # Les colonnes suivantes (ip_debut, ip_fin, id_debut, id_fin, etc.)
-            # sont ignorées ici car ce script ne les utilise pas
-            if len(parts) >= 3:
-                u = parts[0].strip()
-                p = parts[1].strip()
-                e = parts[2].strip()
-
-                run_remote_cmd(admin_pass, u, p, e)
-
-                print(f"⏳ Cooldown 5s...")
-                time.sleep(5)
             else:
-                print(f"⚠️ Ligne malformée (colonnes manquantes) : {line}")
+                print(f"      ✅ NGINX mis à jour avec succès.")
+
+            # --- ÉTAPE B : VPN (WIREGUARD) ---
+            print(f"      🔐 Génération des clés VPN...")
+            res_priv = run_remote_cmd(REMOTE_VPN_IP, USER_VPN, "wg genkey")
+            if res_priv.returncode != 0:
+                print(f"      ❌ Erreur génération clé privée : {res_priv.stderr.strip()}")
+                updated_rows.append(row)
+                continue
+
+            priv_key = res_priv.stdout.strip()
+
+            res_pub = run_remote_cmd(
+                REMOTE_VPN_IP, USER_VPN,
+                f"echo {shlex.quote(priv_key)} | wg pubkey"
+            )
+            if res_pub.returncode != 0:
+                print(f"      ❌ Erreur génération clé publique : {res_pub.stderr.strip()}")
+                updated_rows.append(row)
+                continue
+
+            pub_key = res_pub.stdout.strip()
+
+            if not existing_ip:
+                print(f"      📡 Enregistrement du Peer VPN...")
+                cmd_vpn = (
+                    f"echo -e '\\n# User: {u}\\n[Peer]\\nPublicKey = {pub_key}\\nAllowedIPs = {client_ip}' "
+                    f">> {WG_CONF_PATH} && wg syncconf wg0 <(wg-quick strip wg0)"
+                )
+                res_vpn = run_remote_cmd(REMOTE_VPN_IP, USER_VPN, f"bash -c {shlex.quote(cmd_vpn)}")
+                if res_vpn.returncode != 0:
+                    print(f"      ❌ Erreur VPN syncconf : {res_vpn.stderr.strip()}")
+                else:
+                    print(f"      ✅ VPN activé pour {u}.")
+
+            # --- ÉTAPE C : SAUVEGARDE LOCALE (CSV) ---
+            # On conserve toutes les colonnes, y compris ip_debut/ip_fin/id_debut/id_fin
+            updated_rows.append([
+                u, p, e,
+                priv_key, pub_key, SERVER_PUB_KEY, client_ip,
+                ip_debut, ip_fin, id_debut, id_fin
+            ])
+
+            with open(USER_SOURCE_FILE, "w", newline='') as f_out:
+                writer = csv.writer(f_out)
+                writer.writerow([
+                    "login", "password", "email",
+                    "private_key", "public_key", "server_public_key", "allowed_ip",
+                    "ip_debut", "ip_fin", "id_debut", "id_fin"
+                ])
+                writer.writerows(updated_rows)
+            print(f"      💾 Données enregistrées dans {USER_SOURCE_FILE}")
+
+        except Exception as err:
+            print(f"      ❌ ERREUR lors du traitement de {u} : {err}")
+            updated_rows.append(row)
+
+    print(f"\n--- 🏁 FIN DU SCRIPT ---")
+    print(f"Dernière IP utilisée enregistrée dans : {IP_STORAGE_FILE}")
 
 if __name__ == "__main__":
     main()
